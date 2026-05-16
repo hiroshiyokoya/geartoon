@@ -1,6 +1,6 @@
 use tauri::{AppHandle, Emitter, Manager};
 
-mod auth;
+pub mod auth;
 
 /// PathBuf を Windows の \\?\ プレフィックスなし・スラッシュ区切りの文字列に変換
 fn path_to_slash(p: &std::path::Path) -> String {

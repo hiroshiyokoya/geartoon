@@ -110,10 +110,16 @@ fn random_b64url(len: usize) -> String {
 }
 
 /// PKCE: code_verifier から S256 challenge を導出する。
-fn code_challenge_s256(verifier: &str) -> String {
+pub fn code_challenge_s256(verifier: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(verifier.as_bytes());
     b64url(&hasher.finalize())
+}
+
+/// PKCE の code_verifier / state をランダム生成する。
+/// 戻り値: `(verifier, state)`。
+pub fn generate_pkce() -> (String, String) {
+    (random_b64url(32), random_b64url(36))
 }
 
 /// 現在の Unix 時刻（秒）。
@@ -213,74 +219,29 @@ pub struct BulletTokenResult {
 }
 
 // ---------------------------------------------------------------------------
-// Tauri コマンド
+// 純粋ロジック（Tauri 非依存。テスト・CLI から呼べる）
 // ---------------------------------------------------------------------------
 
-/// ステップ 1: PKCE パラメータを生成し、Nintendo ログイン URL を構築して
-/// ブラウザで開く。`code_verifier` / `state` はアプリ状態に保存する。
-#[tauri::command]
-pub fn start_login(app: AppHandle, state: State<'_, AuthState>) -> Result<String, String> {
-    // PKCE: code_verifier（32バイト）と state（36バイト）を生成。
-    let verifier = random_b64url(32);
-    let csrf_state = random_b64url(36);
-    let challenge = code_challenge_s256(&verifier);
-
-    // 後続の handle_auth_redirect で照合・消費するため保存。
-    {
-        let mut guard = state.inner.lock().map_err(|e| e.to_string())?;
-        *guard = Some(PendingAuth {
-            verifier: verifier.clone(),
-            state: csrf_state.clone(),
-        });
-    }
-
-    // 認可 URL を組み立てる。
-    let url = format!(
+/// PKCE の `verifier` と CSRF `state` から Nintendo ログイン URL を構築する。
+pub fn build_login_url(verifier: &str, state: &str) -> String {
+    let challenge = code_challenge_s256(verifier);
+    format!(
         "{base}?state={state}&redirect_uri={redirect}&client_id={client}\
          &scope={scope}&response_type=session_token_code\
          &session_token_code_challenge={challenge}\
          &session_token_code_challenge_method=S256&theme=login_form",
         base = NA_AUTHORIZE_URL,
-        state = urlencode(&csrf_state),
+        state = urlencode(state),
         redirect = urlencode(REDIRECT_URI),
         client = CLIENT_ID,
         scope = urlencode(SCOPE),
         challenge = challenge,
-    );
-
-    // 既定ブラウザで開く（tauri-plugin-shell の opener を利用）。
-    use tauri_plugin_shell::ShellExt;
-    app.shell()
-        .open(&url, None)
-        .map_err(|e| format!("ブラウザ起動失敗: {e}"))?;
-
-    Ok(url)
+    )
 }
 
-/// 最小限の URL エンコード（クエリ値用）。
-fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    out
-}
-
-/// ステップ 2-3: deep link URL から `session_token_code` を抽出し、
-/// Nintendo API で `session_token` を取得して store に保存する。
-#[tauri::command]
-pub async fn handle_auth_redirect(
-    app: AppHandle,
-    state: State<'_, AuthState>,
-    url: String,
-) -> Result<(), String> {
-    // npf...://auth#session_token_code=...&state=...&session_state=...
-    // フラグメント部をパースする。
+/// リダイレクト URL のフラグメントから `session_token_code` と `state` を抽出する。
+/// 戻り値: `(code, state)`。`state` は URL に含まれなければ `None`。
+pub fn parse_auth_fragment(url: &str) -> Result<(String, Option<String>), String> {
     let fragment = url
         .split_once('#')
         .map(|(_, f)| f.to_string())
@@ -300,26 +261,19 @@ pub async fn handle_auth_redirect(
 
     let code = session_token_code
         .ok_or_else(|| "session_token_code が見つかりません".to_string())?;
+    Ok((code, returned_state))
+}
 
-    // 保存しておいた PKCE パラメータを取り出し、state を照合する。
-    let pending = {
-        let mut guard = state.inner.lock().map_err(|e| e.to_string())?;
-        guard.take().ok_or_else(|| {
-            "進行中のログインがありません（start_login を先に呼んでください）".to_string()
-        })?
-    };
-    if let Some(rs) = returned_state {
-        if rs != pending.state {
-            return Err("state が一致しません（CSRF の可能性）".to_string());
-        }
-    }
-
-    // session_token_code → session_token（application/x-www-form-urlencoded）。
-    let client = http_client()?;
+/// `session_token_code` を `session_token` に交換する（PKCE 検証付き）。
+pub async fn exchange_session_token_code(
+    code: &str,
+    verifier: &str,
+    client: &reqwest::Client,
+) -> Result<String, String> {
     let params = [
         ("client_id", CLIENT_ID),
-        ("session_token_code", code.as_str()),
-        ("session_token_code_verifier", pending.verifier.as_str()),
+        ("session_token_code", code),
+        ("session_token_code_verifier", verifier),
     ];
     let resp = client
         .post(NA_SESSION_TOKEN_URL)
@@ -340,40 +294,15 @@ pub async fn handle_auth_redirect(
         .json()
         .await
         .map_err(|e| format!("session_token レスポンス解析失敗: {e}"))?;
-
-    // session_token を store に保存（長期保存）。
-    let store = app
-        .store(STORE_FILE)
-        .map_err(|e| format!("store オープン失敗: {e}"))?;
-    store.set(
-        STORE_KEY_SESSION_TOKEN,
-        serde_json::Value::String(parsed.session_token),
-    );
-    store
-        .save()
-        .map_err(|e| format!("store 保存失敗: {e}"))?;
-
-    Ok(())
+    Ok(parsed.session_token)
 }
 
-/// ステップ 4-7: 保存済み `session_token` から
-/// id_token → f-token → Coral login (gtoken 元) → WebServiceToken (gtoken)
-/// → bulletToken を順に取得して返す。
-#[tauri::command]
-pub async fn get_bullet_token(app: AppHandle) -> Result<BulletTokenResult, String> {
-    // 保存済み session_token を読む。
-    let session_token = {
-        let store = app
-            .store(STORE_FILE)
-            .map_err(|e| format!("store オープン失敗: {e}"))?;
-        store
-            .get(STORE_KEY_SESSION_TOKEN)
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .ok_or_else(|| "未ログインです（session_token がありません）".to_string())?
-    };
-
-    let client = http_client()?;
-
+/// `session_token` から id_token → f-token → Coral login → WebServiceToken
+/// → bulletToken を順に取得する。
+pub async fn fetch_bullet_token(
+    session_token: &str,
+    client: &reqwest::Client,
+) -> Result<BulletTokenResult, String> {
     // --- ステップ 4: session_token → id_token / access_token ---
     let token_body = serde_json::json!({
         "client_id": CLIENT_ID,
@@ -407,7 +336,7 @@ pub async fn get_bullet_token(app: AppHandle) -> Result<BulletTokenResult, Strin
 
     // --- ステップ 5: id_token → f-token (Coral login 用, hash_method=1) ---
     let f_coral = request_f(
-        &client,
+        client,
         &na_token.id_token,
         HASH_METHOD_CORAL,
         Some(&user.id),
@@ -452,9 +381,8 @@ pub async fn get_bullet_token(app: AppHandle) -> Result<BulletTokenResult, Strin
     let coral_user_id = login_result.user.id;
 
     // --- ステップ 6b: id_token → f-token (WebServiceToken 用, hash_method=2) ---
-    // ここでの token は Coral の accessToken。coral_user_id を付与する。
     let f_web = request_f(
-        &client,
+        client,
         &coral_access_token,
         HASH_METHOD_WEB_SERVICE,
         Some(&user.id),
@@ -528,6 +456,111 @@ pub async fn get_bullet_token(app: AppHandle) -> Result<BulletTokenResult, Strin
     })
 }
 
+/// 最小限の URL エンコード（クエリ値用）。
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Tauri コマンド（薄いラッパー）
+// ---------------------------------------------------------------------------
+
+/// ステップ 1: PKCE パラメータを生成し、Nintendo ログイン URL を構築して
+/// ブラウザで開く。`code_verifier` / `state` はアプリ状態に保存する。
+#[tauri::command]
+pub fn start_login(app: AppHandle, state: State<'_, AuthState>) -> Result<String, String> {
+    let (verifier, csrf_state) = generate_pkce();
+    let url = build_login_url(&verifier, &csrf_state);
+
+    // 後続の handle_auth_redirect で照合・消費するため保存。
+    {
+        let mut guard = state.inner.lock().map_err(|e| e.to_string())?;
+        *guard = Some(PendingAuth {
+            verifier,
+            state: csrf_state,
+        });
+    }
+
+    // 既定ブラウザで開く（tauri-plugin-shell の opener を利用）。
+    use tauri_plugin_shell::ShellExt;
+    app.shell()
+        .open(&url, None)
+        .map_err(|e| format!("ブラウザ起動失敗: {e}"))?;
+
+    Ok(url)
+}
+
+/// ステップ 2-3: deep link URL から `session_token_code` を抽出し、
+/// Nintendo API で `session_token` を取得して store に保存する。
+#[tauri::command]
+pub async fn handle_auth_redirect(
+    app: AppHandle,
+    state: State<'_, AuthState>,
+    url: String,
+) -> Result<(), String> {
+    let (code, returned_state) = parse_auth_fragment(&url)?;
+
+    // 保存しておいた PKCE パラメータを取り出し、state を照合する。
+    let pending = {
+        let mut guard = state.inner.lock().map_err(|e| e.to_string())?;
+        guard.take().ok_or_else(|| {
+            "進行中のログインがありません（start_login を先に呼んでください）".to_string()
+        })?
+    };
+    if let Some(rs) = returned_state {
+        if rs != pending.state {
+            return Err("state が一致しません（CSRF の可能性）".to_string());
+        }
+    }
+
+    let client = http_client()?;
+    let session_token =
+        exchange_session_token_code(&code, &pending.verifier, &client).await?;
+
+    // session_token を store に保存（長期保存）。
+    let store = app
+        .store(STORE_FILE)
+        .map_err(|e| format!("store オープン失敗: {e}"))?;
+    store.set(
+        STORE_KEY_SESSION_TOKEN,
+        serde_json::Value::String(session_token),
+    );
+    store
+        .save()
+        .map_err(|e| format!("store 保存失敗: {e}"))?;
+
+    Ok(())
+}
+
+/// ステップ 4-7: 保存済み `session_token` から
+/// id_token → f-token → Coral login (gtoken 元) → WebServiceToken (gtoken)
+/// → bulletToken を順に取得して返す。
+#[tauri::command]
+pub async fn get_bullet_token(app: AppHandle) -> Result<BulletTokenResult, String> {
+    // 保存済み session_token を読む。
+    let session_token = {
+        let store = app
+            .store(STORE_FILE)
+            .map_err(|e| format!("store オープン失敗: {e}"))?;
+        store
+            .get(STORE_KEY_SESSION_TOKEN)
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .ok_or_else(|| "未ログインです（session_token がありません）".to_string())?
+    };
+
+    let client = http_client()?;
+    fetch_bullet_token(&session_token, &client).await
+}
+
 /// imink f-token API を呼び出す。
 /// - `token`: hash_method=1 では NA の id_token、=2 では Coral の accessToken。
 /// - `na_id`: Nintendo Account ID。
@@ -599,4 +632,70 @@ pub fn logout(app: AppHandle) -> Result<(), String> {
 #[allow(dead_code)]
 pub fn _touch_unused() -> u64 {
     now_unix()
+}
+
+// ---------------------------------------------------------------------------
+// ユニットテスト
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 簡易クエリパーサ: `?` 以降を `key -> value` のリストにする。
+    fn query_pairs(url: &str) -> Vec<(String, String)> {
+        let q = url.split_once('?').map(|(_, q)| q).unwrap_or("");
+        q.split('&')
+            .filter_map(|p| p.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+            .collect()
+    }
+
+    fn query_get<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        pairs
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn build_login_url_contains_required_params() {
+        let url = build_login_url("test-verifier", "test-state");
+        let pairs = query_pairs(&url);
+
+        assert_eq!(query_get(&pairs, "state"), Some("test-state"));
+        // redirect_uri / scope は urlencode されているのでデコード前提で存在のみ確認。
+        assert!(query_get(&pairs, "redirect_uri").is_some(), "redirect_uri 欠落");
+        assert_eq!(query_get(&pairs, "client_id"), Some(CLIENT_ID));
+        assert!(query_get(&pairs, "scope").is_some(), "scope 欠落");
+        assert_eq!(
+            query_get(&pairs, "session_token_code_challenge"),
+            Some(code_challenge_s256("test-verifier").as_str())
+        );
+        assert_eq!(
+            query_get(&pairs, "session_token_code_challenge_method"),
+            Some("S256")
+        );
+    }
+
+    #[test]
+    fn parse_auth_fragment_extracts_code_and_state() {
+        let url = "npf71b963c1b7b6d119://auth#session_token_code=ABC123&state=XYZ789&session_state=foo";
+        let (code, state) = parse_auth_fragment(url).expect("パース成功すべき");
+        assert_eq!(code, "ABC123");
+        assert_eq!(state.as_deref(), Some("XYZ789"));
+    }
+
+    #[test]
+    fn parse_auth_fragment_errors_without_fragment() {
+        let url = "npf71b963c1b7b6d119://auth?session_token_code=ABC123";
+        assert!(parse_auth_fragment(url).is_err());
+    }
+
+    #[test]
+    fn code_challenge_s256_matches_rfc7636_vector() {
+        // RFC 7636 Appendix B の既知テストベクタ。
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let expected = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+        assert_eq!(code_challenge_s256(verifier), expected);
+    }
 }
