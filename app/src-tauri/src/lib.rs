@@ -1,4 +1,6 @@
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
+
+mod auth;
 
 /// PathBuf を Windows の \\?\ プレフィックスなし・スラッシュ区切りの文字列に変換
 fn path_to_slash(p: &std::path::Path) -> String {
@@ -52,7 +54,21 @@ fn get_data_dir(app: AppHandle) -> Result<String, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
-    .invoke_handler(tauri::generate_handler![read_gear_db, get_data_dir])
+    // NSO 認証用プラグイン
+    .plugin(tauri_plugin_shell::init())
+    .plugin(tauri_plugin_store::Builder::default().build())
+    .plugin(tauri_plugin_deep_link::init())
+    // PKCE パラメータ保持用のアプリ状態
+    .manage(auth::AuthState::default())
+    .invoke_handler(tauri::generate_handler![
+      read_gear_db,
+      get_data_dir,
+      auth::start_login,
+      auth::handle_auth_redirect,
+      auth::get_bullet_token,
+      auth::check_auth_status,
+      auth::logout,
+    ])
     .setup(|app| {
       if cfg!(debug_assertions) {
         app.handle().plugin(
@@ -61,6 +77,20 @@ pub fn run() {
             .build(),
         )?;
       }
+
+      // deep-link: npf71b963c1b7b6d119://auth#... を受信したら
+      // フロントへ "deep-link-received" イベントを発火する。
+      // フロント側はこの URL を auth::handle_auth_redirect に渡す。
+      {
+        use tauri_plugin_deep_link::DeepLinkExt;
+        let handle = app.handle().clone();
+        app.deep_link().on_open_url(move |event| {
+          for url in event.urls() {
+            let _ = handle.emit("deep-link-received", url.to_string());
+          }
+        });
+      }
+
       Ok(())
     })
     .run(tauri::generate_context!())

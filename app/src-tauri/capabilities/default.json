@@ -7,6 +7,9 @@
   ],
   "permissions": [
     "core:default",
-    "core:image:default"
+    "core:image:default",
+    "deep-link:default",
+    "shell:allow-open",
+    "store:default"
   ]
 }

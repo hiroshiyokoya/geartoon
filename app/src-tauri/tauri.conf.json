@@ -29,6 +29,14 @@
       }
     }
   },
+  "plugins": {
+    "deep-link": {
+      "mobile": [],
+      "desktop": {
+        "schemes": ["npf71b963c1b7b6d119"]
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",
