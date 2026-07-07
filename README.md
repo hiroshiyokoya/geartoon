@@ -1,5 +1,15 @@
 <img src="app/public/geartoon-logo.png" alt="geartoon" height="300">
 
+> # 📢 geartoon は splabo に統合されました
+>
+> ギア管理機能は戦績アプリ chartoon と統合され、**splabo（スプラボ）** として生まれ変わりました。
+> 所持ギアの取得・一覧表示・コーデ生成はすべて splabo の「ギア」タブに引き継がれています。
+> 今後は **splabo** をご利用ください。
+>
+> 👉 **[splabo リポジトリ](https://github.com/hiroshiyokoya/splabo)** ・ **[最新版をダウンロード](https://github.com/hiroshiyokoya/splabo/releases/latest)**
+>
+> このリポジトリは今後アーカイブ（読み取り専用）されます。
+
 # ギアトゥーン (geartoon)
 
 Nintendo アカウントから非公式 API 経由で Splatoon 3 の所持ギアを取得・表示する OSS の PC アプリです。任天堂株式会社とは無関係で、データ取得に [nxapi](https://github.com/samuelthomas2774/nxapi) を使用しています。
